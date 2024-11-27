@@ -1,0 +1,547 @@
+bl_info = {
+    "name": "Block Placer",
+    "author": "Generated",
+    "version": (1, 0),
+    "blender": (2, 80, 0),
+    "location": "View3D > N-Panel > Block Placer",
+    "description": "Place and delete blocks with customizable grid displacement",
+    "category": "Object",
+}
+
+import bpy
+import bmesh
+from bpy.types import (Panel, Operator)
+from bpy.props import BoolProperty, EnumProperty, FloatVectorProperty
+from mathutils import Vector
+from bpy_extras import view3d_utils
+import time
+import math
+
+def get_placement_direction(obj, hit_point):
+    # Convert hit point to object local space
+    local_point = obj.matrix_world.inverted() @ hit_point
+    
+    # Get the closest face based on local coordinates
+    directions = {
+        'right':  Vector((1, 0, 0)),
+        'left':   Vector((-1, 0, 0)),
+        'front':  Vector((0, -1, 0)),
+        'back':   Vector((0, 1, 0)),
+        'top':    Vector((0, 0, 1)),
+        'bottom': Vector((0, 0, -1))
+    }
+    
+    # Find which face was hit by comparing local coordinates
+    x, y, z = local_point
+    
+    if abs(x) > abs(y) and abs(x) > abs(z):
+        return directions['right'] if x > 0 else directions['left']
+    elif abs(y) > abs(x) and abs(y) > abs(z):
+        return directions['back'] if y > 0 else directions['front']
+    else:
+        return directions['top'] if z > 0 else directions['bottom']
+
+def snap_to_grid(position, grid_spacing, grid_offset):
+    """
+    Snap a position to the grid with custom spacing and offset
+    """
+    return Vector((
+        round((position.x - grid_offset[0]) / grid_spacing[0]) * grid_spacing[0] + grid_offset[0],
+        round((position.y - grid_offset[1]) / grid_spacing[1]) * grid_spacing[1] + grid_offset[1],
+        round((position.z - grid_offset[2]) / grid_spacing[2]) * grid_spacing[2] + grid_offset[2]
+    ))
+
+
+
+def get_active_object_data():
+    """Store the active object's data for cloning"""
+    obj = bpy.context.active_object
+    if obj and obj.type == 'MESH':
+        return obj.data
+    return None
+
+
+class OBJECT_OT_block_placer(Operator):
+    bl_idname = "object.block_placer"
+    bl_label = "Block Placer"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    _timer = None
+    _handle = None
+    is_running = False
+    prev_select_state = None
+    
+    def __init__(self):
+        self._is_placing = False
+        self._is_deleting = False
+        self._last_operation_time = 0
+        self._operation_delay = 0.1  # Delay between operations in seconds
+        self._preview_object = None
+        self._preview_valid = True  # Track if preview position is valid
+        self._last_placement_pos = None  # Track last placement position
+        
+    def get_placement_position(self, context, event):
+        """Get placement position based on current mode"""
+        raycast_result, ray_origin, view_vector = self.get_raycast_under_mouse(context, event)
+        result, location, normal, index, obj, matrix = raycast_result
+        
+        # Handle different placement modes
+        if context.scene.placement_mode == '2D':
+            return self.get_2d_placement_position(context, ray_origin, view_vector)
+        elif context.scene.placement_mode == 'VIEW':
+            return self.get_view_placement_position(context, ray_origin, view_vector)
+        else:  # 3D mode
+            # If we hit a valid object (not preview)
+            if result and obj and obj.type == 'MESH' and obj != self._preview_object:
+                placement_dir = get_placement_direction(obj, location)
+                base_position = obj.location + placement_dir
+            else:
+                # Place at cursor height if no hit
+                base_position = Vector((
+                    context.scene.cursor.location.x,
+                    context.scene.cursor.location.y,
+                    context.scene.cursor.location.z
+                ))
+            
+            return snap_to_grid(
+                base_position,
+                context.scene.grid_spacing,
+                context.scene.grid_offset
+            )
+
+    def get_view_placement_position(self, context, ray_origin, view_vector):
+        """Get placement position for view mode"""
+        # Use the view distance setting
+        view_distance = context.scene.view_build_distance
+        base_position = ray_origin + view_vector * view_distance
+        
+        # Snap to grid with offset
+        return snap_to_grid(
+            base_position,
+            context.scene.grid_spacing,
+            context.scene.grid_offset
+        )
+
+    def get_2d_placement_position(self, context, ray_origin, view_vector):
+        # Get cursor matrix for 2D plane
+        cursor_matrix = context.scene.cursor.matrix
+        plane_normal = cursor_matrix.to_3x3() @ Vector((0, 0, 1))
+        plane_pos = context.scene.cursor.location
+        
+        # Intersect with 2D plane
+        denominator = view_vector.dot(plane_normal)
+        if abs(denominator) > 0.0001:
+            t = (plane_pos - ray_origin).dot(plane_normal) / denominator
+            hit_point = ray_origin + view_vector * t
+            
+            # Snap to grid with offset
+            return snap_to_grid(
+                Vector((hit_point.x, hit_point.y, context.scene.cursor.location.z)),
+                context.scene.grid_spacing,
+                context.scene.grid_offset
+            )
+        return None
+    
+    def modal(self, context, event):
+        if event.type == 'ESC':
+            self.cleanup(context)
+            return {'CANCELLED'}
+        
+        current_time = time.time()
+        time_since_last = current_time - self._last_operation_time
+        placement_interval = 1.0 / context.scene.placement_speed  # Convert speed to interval
+        
+        # Handle left mouse button for placement
+        if event.type == 'LEFTMOUSE':
+            if event.value == 'PRESS':
+                self._is_placing = True
+                self._last_placement_pos = None  # Reset last placement position
+                self._last_operation_time = 0  # Force immediate first placement
+            elif event.value == 'RELEASE':
+                self._is_placing = False
+            return {'RUNNING_MODAL'}
+        
+        # Handle right mouse button for deletion
+        if event.type == 'RIGHTMOUSE':
+            if event.value == 'PRESS':
+                self._is_deleting = True
+                self._last_operation_time = 0  # Force immediate first deletion
+            elif event.value == 'RELEASE':
+                self._is_deleting = False
+            return {'RUNNING_MODAL'}
+
+        # Handle continuous operations and preview
+        if self._is_placing or self._is_deleting or context.scene.show_placement_preview:
+            new_position = self.get_placement_position(context, event)
+            
+            # Update preview if enabled
+            if context.scene.show_placement_preview and new_position:
+                if self._preview_object is None:
+                    self.create_preview(context)
+                if self._preview_object is not None:
+                    self.update_preview(context, new_position)
+            
+            # Handle continuous operations
+            if time_since_last >= placement_interval:
+                if self._is_placing and new_position:
+                    # Only place if position changed from last placement
+                    if not self._last_placement_pos or (new_position - self._last_placement_pos).length > 0.01:
+                        self.place_block(context, event)
+                        self._last_placement_pos = new_position.copy()
+                        self._last_operation_time = current_time
+                elif self._is_deleting:
+                    self.delete_block(context, event)
+                    self._last_operation_time = current_time
+                return {'RUNNING_MODAL'}
+
+        return {'PASS_THROUGH'}
+
+    def get_raycast_under_mouse(self, context, event):
+        # Get mouse position and ray
+        mouse_pos = (event.mouse_region_x, event.mouse_region_y)
+        region = context.region
+        region_3d = context.region_data
+        view_vector = view3d_utils.region_2d_to_vector_3d(region, region_3d, mouse_pos)
+        ray_origin = view3d_utils.region_2d_to_origin_3d(region, region_3d, mouse_pos)
+        
+        # Perform raycast
+        return context.scene.ray_cast(
+            context.view_layer.depsgraph,
+            ray_origin,
+            view_vector
+        ), ray_origin, view_vector
+    
+    def create_block(self, context, location):
+        """Create new block with current transform settings"""
+        if context.scene.use_custom_mesh and context.scene.custom_mesh:
+            # Clone custom object
+            custom_obj = context.scene.custom_mesh
+            bpy.ops.object.add(
+                type='MESH',
+                location=location
+            )
+            new_block = context.active_object
+            new_block.data = custom_obj.data.copy()
+        else:
+            # Create default cube
+            bpy.ops.mesh.primitive_cube_add(size=1.0, location=location)
+            new_block = context.active_object
+        
+        # Apply transforms
+        new_block.scale = context.scene.block_scale
+        new_block.rotation_euler = [math.radians(angle) for angle in context.scene.block_rotation]
+        
+        # Setup block
+        new_block.select_set(False)
+        context.view_layer.objects.active = None
+        return new_block
+
+    def place_block(self, context, event):
+        raycast_result, ray_origin, view_vector = self.get_raycast_under_mouse(context, event)
+        result, location, normal, index, obj, matrix = raycast_result
+        
+        if context.scene.placement_mode == '2D':
+            new_position = self.get_2d_placement_position(context, ray_origin, view_vector)
+            if new_position:
+                self.create_block(context, new_position)
+        elif context.scene.placement_mode == 'VIEW':
+            new_position = self.get_view_placement_position(context, ray_origin, view_vector)
+            if new_position:
+                self.create_block(context, new_position)
+        else:
+            if result:
+                if obj.type == 'MESH':
+                    placement_dir = get_placement_direction(obj, location)
+                    base_position = obj.location + placement_dir
+                else:
+                    base_position = Vector((
+                        location.x,
+                        location.y,
+                        location.z + 0.5
+                    ))
+            else:
+                base_position = Vector((
+                    context.scene.cursor.location.x,
+                    context.scene.cursor.location.y,
+                    0.5
+                ))
+            
+            new_position = snap_to_grid(
+                base_position,
+                context.scene.grid_spacing,
+                context.scene.grid_offset
+            )
+            
+            self.create_block(context, new_position)
+    
+    def delete_block(self, context, event):
+        """Delete block under cursor, ignoring preview object"""
+        raycast_result, _, _ = self.get_raycast_under_mouse(context, event)
+        result, location, normal, index, obj, matrix = raycast_result
+        
+        if result and obj and obj.type == 'MESH' and obj != self._preview_object:
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+    def cleanup(self, context):
+        if self._timer:
+            context.window_manager.event_timer_remove(self._timer)
+        
+        # Remove preview safely
+        self.remove_preview()
+        
+        # Restore selection state (safely)
+        for obj in context.view_layer.objects:
+            if obj is not None:  # Check for valid object
+                obj.hide_select = False
+        
+        context.window.cursor_set('DEFAULT')
+        self.is_running = False
+        
+    def invoke(self, context, event):
+            if context.area.type == 'VIEW_3D':
+                # Disable selection for ALL objects
+                for obj in context.view_layer.objects:
+                    obj.hide_select = True
+                
+                # Change cursor to indicate build mode
+                context.window.cursor_set('CROSSHAIR')
+                
+                # Create initial preview if enabled
+                if context.scene.show_placement_preview:
+                    self.create_preview(context)
+                
+                # Add timer for modal
+                self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
+                
+                # Start modal
+                context.window_manager.modal_handler_add(self)
+                
+                self.is_running = True
+                return {'RUNNING_MODAL'}
+            else:
+                self.report({'WARNING'}, "View3D not found, cannot run operator")
+                return {'CANCELLED'}
+
+
+
+
+
+
+
+
+
+    def create_preview(self, context):
+            """Create or update preview object"""
+            if not context.scene.show_placement_preview:
+                self.remove_preview()
+                return
+                
+            if self._preview_object is None:
+                if context.scene.use_custom_mesh and context.scene.custom_mesh:
+                    # Clone custom object for preview
+                    bpy.ops.object.add(type='MESH')
+                    self._preview_object = context.active_object
+                    self._preview_object.data = context.scene.custom_mesh.data.copy()
+                else:
+                    # Create default cube preview
+                    bpy.ops.mesh.primitive_cube_add(size=1.0)
+                    self._preview_object = context.active_object
+                
+                # Setup preview object
+                self._preview_object.display_type = 'WIRE'
+                self._preview_object.hide_render = True
+                self._preview_object.name = "PlacementPreview"
+                
+            # Apply current transform settings
+            self._preview_object.scale = context.scene.block_scale
+            self._preview_object.rotation_euler = [math.radians(angle) for angle in context.scene.block_rotation]
+        
+    def remove_preview(self):
+        """Remove preview object if it exists"""
+        if self._preview_object:
+            bpy.data.objects.remove(self._preview_object, do_unlink=True)
+            self._preview_object = None
+    
+    def update_preview(self, context, position):
+        """Update preview object position safely"""
+        if not context.scene.show_placement_preview:
+            return
+            
+        if self._preview_object is None:
+            return
+            
+        try:
+            self._preview_object.location = position
+        except ReferenceError:
+            # Preview object was removed unexpectedly
+            self._preview_object = None
+            self.create_preview(context)
+
+class VIEW3D_PT_block_placer(Panel):
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Block Placer'
+    bl_label = "Block Placer"
+    
+    def draw(self, context):
+        layout = self.layout
+        
+        row = layout.row()
+        if not OBJECT_OT_block_placer.is_running:
+            row.operator("object.block_placer", text="Start Block Placement")
+        else:
+            row.label(text="Block Placement Active")
+            row.label(text="(ESC to exit)")
+        
+        # Add placement mode selection
+        box = layout.box()
+        box.label(text="Placement Settings")
+        box.prop(context.scene, "placement_mode", text="Mode")
+        
+        # View mode settings
+        if context.scene.placement_mode == 'VIEW':
+            view_box = box.box()
+            view_box.label(text="View Mode Settings")
+            view_box.prop(context.scene, "view_build_distance", text="Build Distance")
+        
+        # Transform settings
+        box = layout.box()
+        box.label(text="Transform Settings")
+        box.prop(context.scene, "block_scale", text="Scale")
+        box.prop(context.scene, "block_rotation", text="Rotation")
+        
+        # Object selection
+        box = layout.box()
+        box.label(text="Object Settings")
+        box.prop(context.scene, "use_custom_mesh", text="Use Custom Object")
+        if context.scene.use_custom_mesh:
+            box.prop(context.scene, "custom_mesh", text="Object")
+        
+        # Grid settings
+        box = layout.box()
+        box.label(text="Grid Settings")
+        box.prop(context.scene, "grid_spacing", text="Grid Spacing")
+        box.prop(context.scene, "grid_offset", text="Grid Offset")
+
+
+
+        # Preview and Speed Settings
+        box = layout.box()
+        box.label(text="Placement Settings")
+        box.prop(context.scene, "show_placement_preview", text="Show Preview")
+        box.prop(context.scene, "placement_speed", text="Placement Speed")
+
+classes = (
+    OBJECT_OT_block_placer,
+    VIEW3D_PT_block_placer,
+)
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    
+    # Register placement mode property
+    bpy.types.Scene.placement_mode = EnumProperty(
+        items=[
+            ('3D', '3D Mode', 'Place blocks in 3D space with face snapping'),
+            ('2D', '2D Mode', 'Place blocks on a 2D plane at cursor height'),
+            ('VIEW', 'View Mode', 'Place blocks at fixed distance from view')
+        ],
+        name="Placement Mode",
+        default='3D'
+    )
+    
+    # Register view mode distance property
+    bpy.types.Scene.view_build_distance = bpy.props.FloatProperty(
+        name="View Build Distance",
+        description="Distance from view for placing blocks in view mode",
+        default=3.0,
+        min=0.1,
+        soft_max=10.0
+    )
+    
+    # Register grid customization properties
+    bpy.types.Scene.grid_spacing = FloatVectorProperty(
+        name="Grid Spacing",
+        description="Spacing between grid lines on each axis",
+        default=(1.0, 1.0, 1.0),
+        min=0.001,
+        soft_min=0.1,
+        size=3
+    )
+    
+    bpy.types.Scene.grid_offset = FloatVectorProperty(
+        name="Grid Offset",
+        description="Offset of the grid from world origin",
+        default=(0.0, 0.0, 0.0),
+        size=3
+    )
+
+
+
+    # Register transform properties
+    bpy.types.Scene.block_scale = FloatVectorProperty(
+        name="Scale",
+        description="Scale of placed objects",
+        default=(1.0, 1.0, 1.0),
+        min=0.001,
+        soft_min=0.1,
+        size=3
+    )
+    
+    bpy.types.Scene.block_rotation = FloatVectorProperty(
+        name="Rotation",
+        description="Rotation of placed objects (degrees)",
+        default=(0.0, 0.0, 0.0),
+        subtype='EULER',
+        size=3
+    )
+    
+    bpy.types.Scene.custom_mesh = bpy.props.PointerProperty(
+        type=bpy.types.Object,
+        name="Custom Object",
+        description="Object to place instead of cube",
+        poll=lambda self, obj: obj.type == 'MESH'
+    )
+    
+    bpy.types.Scene.use_custom_mesh = bpy.props.BoolProperty(
+        name="Use Custom Object",
+        description="Place custom object instead of cube",
+        default=False
+    )
+
+    # Register preview and speed properties
+    bpy.types.Scene.show_placement_preview = bpy.props.BoolProperty(
+        name="Show Placement Preview",
+        description="Show preview of object placement",
+        default=True
+    )
+    
+    bpy.types.Scene.placement_speed = bpy.props.FloatProperty(
+        name="Placement Speed",
+        description="Number of placements per second when dragging",
+        default=10.0,
+        min=0.1,
+        max=100.0,
+        soft_max=50.0
+    )
+
+def unregister():
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+    
+    del bpy.types.Scene.placement_mode
+    del bpy.types.Scene.grid_spacing
+    del bpy.types.Scene.grid_offset
+    del bpy.types.Scene.view_build_distance
+
+    del bpy.types.Scene.block_scale
+    del bpy.types.Scene.block_rotation
+    del bpy.types.Scene.custom_mesh
+    del bpy.types.Scene.use_custom_mesh
+
+    del bpy.types.Scene.show_placement_preview
+    del bpy.types.Scene.placement_speed
+
+if __name__ == "__main__":
+    register()
