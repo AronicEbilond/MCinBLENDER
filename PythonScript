@@ -12,7 +12,7 @@ import bpy
 import bmesh
 from bpy.types import (Panel, Operator)
 from bpy.props import BoolProperty, EnumProperty, FloatVectorProperty
-from mathutils import Vector
+from mathutils import Vector, Matrix
 from bpy_extras import view3d_utils
 import time
 import math
@@ -51,7 +51,42 @@ def snap_to_grid(position, grid_spacing, grid_offset):
         round((position.z - grid_offset[2]) / grid_spacing[2]) * grid_spacing[2] + grid_offset[2]
     ))
 
-
+def get_relative_rotation(hit_obj, hit_normal, hit_position):
+    """Calculate rotation for block based on hit surface and position"""
+    # Convert hit point to object local space
+    local_point = hit_obj.matrix_world.inverted() @ hit_position
+    obj_rot = hit_obj.rotation_euler
+    
+    # Determine if we hit corner, edge, or face
+    epsilon = 0.1  # Threshold for corner/edge detection
+    dims = [0.5, 0.5, 0.5]  # Assuming unit cube
+    
+    # Count how many coordinates are at extremes
+    at_extreme = sum(1 for i, coord in enumerate([abs(local_point[i]) for i in range(3)])
+                    if abs(abs(coord) - dims[i]) < epsilon)
+    
+    if at_extreme >= 2:  # Corner hit
+        # Calculate rotation 90 degrees around hit normal
+        rot_matrix = Matrix.Rotation(math.radians(45), 4, hit_normal)
+        new_rotation = (rot_matrix @ hit_obj.matrix_world).to_euler()
+        return new_rotation
+    elif at_extreme == 1:  # Edge hit
+        # Find primary axis of edge
+        edge_axis = None
+        for i, coord in enumerate([abs(local_point[i]) for i in range(3)]):
+            if abs(abs(coord) - dims[i]) >= epsilon:
+                edge_axis = Vector((0, 0, 0))
+                edge_axis[i] = 1
+                break
+        
+        if edge_axis:
+            # Rotate 90 degrees around edge axis
+            rot_matrix = Matrix.Rotation(math.radians(45), 4, edge_axis)
+            new_rotation = (rot_matrix @ hit_obj.matrix_world).to_euler()
+            return new_rotation
+    
+    # Face hit or fallback - inherit parent rotation
+    return hit_obj.rotation_euler
 
 def get_active_object_data():
     """Store the active object's data for cloning"""
@@ -91,17 +126,32 @@ class OBJECT_OT_block_placer(Operator):
         elif context.scene.placement_mode == 'VIEW':
             return self.get_view_placement_position(context, ray_origin, view_vector)
         else:  # 3D mode
+            # Get a default position based on view ray if no hit
+            fallback_position = ray_origin + view_vector * context.scene.view_build_distance
+            
             # If we hit a valid object (not preview)
             if result and obj and obj.type == 'MESH' and obj != self._preview_object:
                 placement_dir = get_placement_direction(obj, location)
                 base_position = obj.location + placement_dir
             else:
-                # Place at cursor height if no hit
-                base_position = Vector((
-                    context.scene.cursor.location.x,
-                    context.scene.cursor.location.y,
-                    context.scene.cursor.location.z
-                ))
+                # Use ray intersection with ground plane or last valid position
+                if self._last_placement_pos:
+                    # Use last placement height as reference
+                    plane_height = self._last_placement_pos.z
+                else:
+                    # Use cursor height as initial reference
+                    plane_height = context.scene.cursor.location.z
+                
+                # Calculate intersection with horizontal plane at reference height
+                plane_normal = Vector((0, 0, 1))
+                denominator = view_vector.dot(plane_normal)
+                
+                if abs(denominator) > 0.0001:  # Check if ray is not parallel to plane
+                    t = (plane_height - ray_origin.z) / view_vector.z
+                    base_position = ray_origin + view_vector * t
+                else:
+                    # If ray is parallel to plane, use fallback position
+                    base_position = fallback_position
             
             return snap_to_grid(
                 base_position,
@@ -119,7 +169,7 @@ class OBJECT_OT_block_placer(Operator):
         return snap_to_grid(
             base_position,
             context.scene.grid_spacing,
-            context.scene.grid_offset
+            context.scene.grid_offset,
         )
 
     def get_2d_placement_position(self, context, ray_origin, view_vector):
@@ -138,11 +188,22 @@ class OBJECT_OT_block_placer(Operator):
             return snap_to_grid(
                 Vector((hit_point.x, hit_point.y, context.scene.cursor.location.z)),
                 context.scene.grid_spacing,
-                context.scene.grid_offset
+                context.scene.grid_offset,
             )
         return None
     
+    def get_placement_hit_info(self, context):
+        """Get information about what we're placing against"""
+        if hasattr(self, '_last_hit_info'):
+            return self._last_hit_info
+        return None
+
     def modal(self, context, event):
+        # Pass through view navigation events
+        if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE'} or \
+           (event.type == 'MOUSEMOVE' and event.alt):
+            return {'PASS_THROUGH'}
+
         if event.type == 'ESC':
             self.cleanup(context)
             return {'CANCELLED'}
@@ -151,6 +212,19 @@ class OBJECT_OT_block_placer(Operator):
         time_since_last = current_time - self._last_operation_time
         placement_interval = 1.0 / context.scene.placement_speed  # Convert speed to interval
         
+        if event.type == 'MOUSEMOVE':
+            mouse_pos = (event.mouse_region_x, event.mouse_region_y)
+            region = context.region
+            region_3d = context.region_data
+            view_vector = view3d_utils.region_2d_to_vector_3d(region, region_3d, mouse_pos)
+            ray_origin = view3d_utils.region_2d_to_origin_3d(region, region_3d, mouse_pos)
+            
+            self._last_hit_info = context.scene.ray_cast(
+                context.view_layer.depsgraph,
+                ray_origin,
+                view_vector
+            )
+
         # Handle left mouse button for placement
         if event.type == 'LEFTMOUSE':
             if event.value == 'PRESS':
@@ -212,30 +286,64 @@ class OBJECT_OT_block_placer(Operator):
         ), ray_origin, view_vector
     
     def create_block(self, context, location):
-        """Create new block with current transform settings"""
+        """Create new block with separated rotation handling"""
         if context.scene.use_custom_mesh and context.scene.custom_mesh:
-            # Clone custom object
             custom_obj = context.scene.custom_mesh
-            bpy.ops.object.add(
-                type='MESH',
-                location=location
-            )
+            bpy.ops.object.add(type='MESH', location=location)
             new_block = context.active_object
             new_block.data = custom_obj.data.copy()
         else:
-            # Create default cube
             bpy.ops.mesh.primitive_cube_add(size=1.0, location=location)
             new_block = context.active_object
-        
-        # Apply transforms
+
+        # Check for incremental rotation
+        if any(context.scene.rotation_increment_euler):
+            context.scene.placement_count += 1
+            increment_rot = context.scene.rotation_increment_euler
+            new_block.rotation_euler = (
+                math.radians(increment_rot[0] * context.scene.placement_count),
+                math.radians(increment_rot[1] * context.scene.placement_count),
+                math.radians(increment_rot[2] * context.scene.placement_count)
+            )
+        # Check for relative rotation
+        elif any([context.scene.face_rotation, 
+                context.scene.edge_rotation,
+                context.scene.corner_rotation]):
+            hit_info = self.get_placement_hit_info(context)
+            if hit_info and hit_info[0]:
+                _, location, normal, _, obj, _ = hit_info
+                
+                # Calculate surface type
+                local_point = obj.matrix_world.inverted() @ location
+                dims = [0.5, 0.5, 0.5]  # Assuming unit cube
+                epsilon = 0.1  # Threshold for detection
+                
+                # Count extremes to determine surface type
+                at_extreme = sum(1 for i, coord in enumerate([abs(local_point[i]) for i in range(3)])
+                            if abs(abs(coord) - dims[i]) < epsilon)
+                
+                # Apply rotation based on surface type and settings
+                if context.scene.conform_to_normal:
+                    rotation = get_relative_rotation(obj, normal, location)
+                    new_block.rotation_euler = rotation
+                else:
+                    if at_extreme >= 2:  # Corner
+                        new_block.rotation_euler = [math.radians(angle) for angle in context.scene.corner_rotation]
+                    elif at_extreme == 1:  # Edge
+                        new_block.rotation_euler = [math.radians(angle) for angle in context.scene.edge_rotation]
+                    else:  # Face
+                        new_block.rotation_euler = [math.radians(angle) for angle in context.scene.face_rotation]
+        else:
+            new_block.rotation_euler = [math.radians(angle) for angle in context.scene.block_rotation]
+
+        # Apply scale
         new_block.scale = context.scene.block_scale
-        new_block.rotation_euler = [math.radians(angle) for angle in context.scene.block_rotation]
-        
-        # Setup block
         new_block.select_set(False)
         context.view_layer.objects.active = None
         return new_block
 
+
+    
     def place_block(self, context, event):
         raycast_result, ray_origin, view_vector = self.get_raycast_under_mouse(context, event)
         result, location, normal, index, obj, matrix = raycast_result
@@ -275,28 +383,21 @@ class OBJECT_OT_block_placer(Operator):
             self.create_block(context, new_position)
     
     def delete_block(self, context, event):
-        """Delete block under cursor, ignoring preview object"""
+        """Delete block under cursor with proper preview handling"""
         raycast_result, _, _ = self.get_raycast_under_mouse(context, event)
         result, location, normal, index, obj, matrix = raycast_result
         
-        if result and obj and obj.type == 'MESH' and obj != self._preview_object:
-            bpy.data.objects.remove(obj, do_unlink=True)
+        if result and obj and obj.type == 'MESH':
+            try:
+                # Don't delete preview object
+                if obj == self._preview_object:
+                    return
+                    
+                if obj.name in bpy.data.objects:
+                    bpy.data.objects.remove(obj, do_unlink=True)
+            except ReferenceError:
+                pass
 
-    def cleanup(self, context):
-        if self._timer:
-            context.window_manager.event_timer_remove(self._timer)
-        
-        # Remove preview safely
-        self.remove_preview()
-        
-        # Restore selection state (safely)
-        for obj in context.view_layer.objects:
-            if obj is not None:  # Check for valid object
-                obj.hide_select = False
-        
-        context.window.cursor_set('DEFAULT')
-        self.is_running = False
-        
     def invoke(self, context, event):
             if context.area.type == 'VIEW_3D':
                 # Disable selection for ALL objects
@@ -328,60 +429,242 @@ class OBJECT_OT_block_placer(Operator):
 
 
 
-
+    def cleanup(self, context):
+        """Clean up objects and states safely"""
+        if self._timer:
+            context.window_manager.event_timer_remove(self._timer)
+        
+        # Remove preview object safely
+        if hasattr(self, '_preview_object') and self._preview_object:
+            try:
+                if self._preview_object.name in bpy.data.objects:
+                    bpy.data.objects.remove(self._preview_object, do_unlink=True)
+            except ReferenceError:
+                pass
+            self._preview_object = None
+        
+        # Restore selection state safely
+        for obj in context.view_layer.objects:
+            try:
+                if obj and obj.name in bpy.data.objects:
+                    obj.hide_select = False
+            except ReferenceError:
+                continue
+        
+        context.window.cursor_set('DEFAULT')
+        self.is_running = False
 
     def create_preview(self, context):
-            """Create or update preview object"""
-            if not context.scene.show_placement_preview:
-                self.remove_preview()
+        """Create or update preview object with proper visibility"""
+        if not context.scene.show_placement_preview:
+            if self._preview_object:
+                try:
+                    if self._preview_object.name in bpy.data.objects:
+                        bpy.data.objects.remove(self._preview_object, do_unlink=True)
+                except ReferenceError:
+                    pass
+                self._preview_object = None
                 return
                 
-            if self._preview_object is None:
-                if context.scene.use_custom_mesh and context.scene.custom_mesh:
-                    # Clone custom object for preview
-                    bpy.ops.object.add(type='MESH')
-                    self._preview_object = context.active_object
-                    self._preview_object.data = context.scene.custom_mesh.data.copy()
-                else:
-                    # Create default cube preview
-                    bpy.ops.mesh.primitive_cube_add(size=1.0)
-                    self._preview_object = context.active_object
-                
-                # Setup preview object
-                self._preview_object.display_type = 'WIRE'
-                self._preview_object.hide_render = True
-                self._preview_object.name = "PlacementPreview"
-                
-            # Apply current transform settings
-            self._preview_object.scale = context.scene.block_scale
-            self._preview_object.rotation_euler = [math.radians(angle) for angle in context.scene.block_rotation]
-        
-    def remove_preview(self):
-        """Remove preview object if it exists"""
-        if self._preview_object:
-            bpy.data.objects.remove(self._preview_object, do_unlink=True)
-            self._preview_object = None
-    
-    def update_preview(self, context, position):
-        """Update preview object position safely"""
-        if not context.scene.show_placement_preview:
-            return
-            
         if self._preview_object is None:
-            return
+            bpy.ops.mesh.primitive_cube_add(size=1.0)
+            self._preview_object = context.active_object
+            self._preview_object.display_type = 'WIRE'
+            self._preview_object.hide_render = True
+            self._preview_object.name = "PlacementPreview"
             
+            # Setup preview materials
+            self._setup_preview_materials()
+
+    def _setup_preview_materials(self):
+        """Setup basic preview materials"""
+        self._preview_object.data.materials.clear()
+        
+        # Create highlight material
+        mat = bpy.data.materials.new(name="PreviewHighlight")
+        mat.use_nodes = True
+        bsdf = mat.node_tree.nodes["Principled BSDF"]
+        bsdf.inputs["Base Color"].default_value = (0.2, 0.8, 1, 1)
+        bsdf.inputs["Alpha"].default_value = 0.3
+        mat.blend_method = 'BLEND'
+        mat.show_transparent_back = False
+        self._preview_object.data.materials.append(mat)
+
+    def update_preview(self, context, position):
+        """Update preview position with proper error handling"""
+        if not context.scene.show_placement_preview:
+            if self._preview_object:
+                try:
+                    if self._preview_object.name in bpy.data.objects:
+                        bpy.data.objects.remove(self._preview_object, do_unlink=True)
+                except ReferenceError:
+                    pass
+                self._preview_object = None
+                return
+                
+        if not self._preview_object:
+            self.create_preview(context)
+        
         try:
+            if not self._preview_object or self._preview_object.name not in bpy.data.objects:
+                self.create_preview(context)
+                
             self._preview_object.location = position
+            
+            # Only apply geo transforms if enabled
+            if context.scene.use_geo_transforms:    
+                # Handle preview rotation based on placement type
+                if any(context.scene.rotation_increment_euler):
+                    # Show incremental rotation preview
+                    increment_rot = context.scene.rotation_increment_euler
+                    preview_rotation = (
+                        math.radians(increment_rot[0] * (context.scene.placement_count + 1)),
+                        math.radians(increment_rot[1] * (context.scene.placement_count + 1)),
+                        math.radians(increment_rot[2] * (context.scene.placement_count + 1))
+                    )
+                    self._preview_object.rotation_euler = preview_rotation
+                
+                elif any([context.scene.face_rotation_angle,
+                        context.scene.edge_rotation_angle,
+                        context.scene.corner_rotation_angle]):
+                    # Show relative rotation preview
+                    hit_info = self.get_placement_hit_info(context)
+                    if hit_info and hit_info[0] and hit_info[4]:  # Verify we have valid object
+                        try:
+                            _, location, normal, _, obj, _ = hit_info
+                            if obj and obj.name in bpy.data.objects:
+                                rotation = get_relative_rotation(obj, normal, location)
+                                self._preview_object.rotation_euler = rotation
+                        except ReferenceError:
+                            # Fall back to base rotation if hit object was removed
+                            self._preview_object.rotation_euler = [math.radians(angle) for angle in context.scene.block_rotation]
+            else:
+                # Show base rotation preview when geo transforms disabled
+                self._preview_object.rotation_euler = [math.radians(angle) for angle in context.scene.block_rotation]
+                    
         except ReferenceError:
             # Preview object was removed unexpectedly
             self._preview_object = None
-            self.create_preview(context)
+
+
+
+
+
+
+
+
+
+class OBJECT_OT_reset_vector(Operator):
+    bl_idname = "block_placer.reset_vector"
+    bl_label = "Reset Vector"
+    bl_description = "Reset vector property to default values"
+    
+    property_name: bpy.props.StringProperty()
+    
+    def execute(self, context):
+        if self.property_name == "grid_spacing":
+            context.scene.grid_spacing = (1.0, 1.0, 1.0)
+        elif self.property_name == "grid_offset":
+            context.scene.grid_offset = (0.0, 0.0, 0.0)
+        elif self.property_name == "block_scale":
+            context.scene.block_scale = (1.0, 1.0, 1.0)
+        elif self.property_name == "block_rotation":
+            context.scene.block_rotation = (0.0, 0.0, 0.0)
+        elif self.property_name == "rotation_increment_euler":
+            context.scene.rotation_increment_euler = (0.0, 0.0, 0.0)
+        elif self.property_name == "face_rotation":
+            context.scene.face_rotation = (0.0, 0.0, 0.0)
+        elif self.property_name == "edge_rotation":
+            context.scene.edge_rotation = (0.0, 0.0, 0.0)
+        elif self.property_name == "corner_rotation":
+            context.scene.corner_rotation = (0.0, 0.0, 0.0)
+        return {'FINISHED'}
+
+class OBJECT_OT_save_preset(Operator):
+    bl_idname = "block_placer.save_preset"
+    bl_label = "Save Current as Preset"
+    bl_description = "Save current settings as a new preset"
+    
+    preset_name: bpy.props.StringProperty(
+        name="Preset Name",
+        description="Name for the new preset",
+        default="New Preset"
+    )
+    
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+    
+    def execute(self, context):
+        # Add current settings to presets
+        new_preset = context.scene.block_placer_presets.add()
+        new_preset.name = self.preset_name
+        new_preset.grid_spacing = context.scene.grid_spacing
+        new_preset.grid_offset = context.scene.grid_offset
+        new_preset.block_scale = context.scene.block_scale
+        new_preset.block_rotation = context.scene.block_rotation
+        new_preset.rotation_increment_euler = context.scene.rotation_increment_euler
+        new_preset.face_rotation = context.scene.face_rotation
+        new_preset.edge_rotation = context.scene.edge_rotation
+        new_preset.corner_rotation = context.scene.corner_rotation
+        return {'FINISHED'}
+
+class OBJECT_OT_load_preset(Operator):
+    bl_idname = "block_placer.load_preset"
+    bl_label = "Load Preset"
+    bl_description = "Load selected preset"
+    
+    preset_name: bpy.props.StringProperty()
+    
+    def execute(self, context):
+        for preset in context.scene.block_placer_presets:
+            if preset.name == self.preset_name:
+                context.scene.grid_spacing = preset.grid_spacing
+                context.scene.grid_offset = preset.grid_offset
+                context.scene.block_scale = preset.block_scale
+                context.scene.block_rotation = preset.block_rotation
+                context.scene.rotation_increment_euler = preset.rotation_increment_euler
+                context.scene.face_rotation = preset.face_rotation
+                context.scene.edge_rotation = preset.edge_rotation
+                context.scene.corner_rotation = preset.corner_rotation
+                context.scene.block_placer_preset = preset.name
+                break
+        return {'FINISHED'}
+
+# Preset properties and menu
+class BlockPlacerPreset(bpy.types.PropertyGroup):
+    name: bpy.props.StringProperty()
+    grid_spacing: FloatVectorProperty(size=3)
+    grid_offset: FloatVectorProperty(size=3)
+    block_scale: FloatVectorProperty(size=3)
+    block_rotation: FloatVectorProperty(size=3)
+    rotation_increment_euler: FloatVectorProperty(size=3)
+    face_rotation: FloatVectorProperty(size=3)
+    edge_rotation: FloatVectorProperty(size=3)
+    corner_rotation: FloatVectorProperty(size=3)
+
+class VIEW3D_MT_block_placer_presets(bpy.types.Menu):
+    bl_label = "Block Placer Presets"
+    
+    def draw(self, context):
+        layout = self.layout
+        for preset in context.scene.block_placer_presets:
+            op = layout.operator("block_placer.load_preset", text=preset.name)
+            op.preset_name = preset.name
+
+
+
+
+
+
+
+
+
 
 class VIEW3D_PT_block_placer(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'Block Placer'
-    bl_label = "Block Placer"
+    bl_label = "Relativity"
     
     def draw(self, context):
         layout = self.layout
@@ -393,47 +676,180 @@ class VIEW3D_PT_block_placer(Panel):
             row.label(text="Block Placement Active")
             row.label(text="(ESC to exit)")
         
-        # Add placement mode selection
+        # Placement Settings with Presets
         box = layout.box()
         box.label(text="Placement Settings")
+        
+        row = box.row()
+        row.menu("VIEW3D_MT_block_placer_presets", text=context.scene.block_placer_preset)
+        row.operator("block_placer.save_preset", text="", icon='ADD')
+        
+        box.prop(context.scene, "show_placement_preview", text="Show Preview")
+        box.prop(context.scene, "placement_speed", text="Placement Speed")
         box.prop(context.scene, "placement_mode", text="Mode")
         
-        # View mode settings
         if context.scene.placement_mode == 'VIEW':
             view_box = box.box()
             view_box.label(text="View Mode Settings")
             view_box.prop(context.scene, "view_build_distance", text="Build Distance")
-        
-        # Transform settings
+
+        # Grid settings with default expanded state
         box = layout.box()
-        box.label(text="Transform Settings")
-        box.prop(context.scene, "block_scale", text="Scale")
-        box.prop(context.scene, "block_rotation", text="Rotation")
+        row = box.row()
+        row.prop(context.scene, "show_grid", icon='TRIA_DOWN' if context.scene.show_grid else 'TRIA_RIGHT', icon_only=True, emboss=False)
+        row.label(text="Grid Settings")
         
+        if context.scene.show_grid:
+            # Dotting Spacing
+            col = box.column(align=True)
+            col.label(text="Dotting Spacing:")
+            row = col.row(align=True)
+            row.prop(context.scene, "grid_spacing", text="XYZ")
+            row = col.row()
+            row.operator("block_placer.reset_vector", text="Reset").property_name = "grid_spacing"
+            
+            # Grid Offset
+            col = box.column(align=True)
+            col.label(text="Grid Map Offset:")
+            row = col.row(align=True)
+            row.prop(context.scene, "grid_offset", text="XYZ")
+            row = col.row()
+            row.operator("block_placer.reset_vector", text="Reset").property_name = "grid_offset"
+
+class VIEW3D_PT_block_placer2(Panel):
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Block Placer'
+    bl_label = "Transform"
+    
+    def draw(self, context):
+        layout = self.layout
+
+        # Scale settings
+        box = layout.box()
+        row = box.row()
+        row.prop(context.scene, "show_scale", icon='TRIA_DOWN' if context.scene.show_scale else 'TRIA_RIGHT', icon_only=True, emboss=False)
+        row.label(text="Scale")
+        
+        if context.scene.show_scale:
+            col = box.column(align=True)
+            row = col.row(align=True)
+            row.prop(context.scene, "block_scale", text="XYZ")
+            row = col.row()
+            row.operator("block_placer.reset_vector", text="Reset").property_name = "block_scale"
+
+        # Base rotation
+        box = layout.box()
+        row = box.row()
+        row.prop(context.scene, "show_rotation", icon='TRIA_DOWN' if context.scene.show_rotation else 'TRIA_RIGHT', icon_only=True, emboss=False)
+        row.label(text="Rotation")
+        
+        if context.scene.show_rotation:
+            col = box.column(align=True)
+            row = col.row(align=True)
+            row.prop(context.scene, "block_rotation", text="XYZ")
+            row = col.row()
+            row.operator("block_placer.reset_vector", text="Reset").property_name = "block_rotation"
+
         # Object selection
         box = layout.box()
         box.label(text="Object Settings")
         box.prop(context.scene, "use_custom_mesh", text="Use Custom Object")
         if context.scene.use_custom_mesh:
             box.prop(context.scene, "custom_mesh", text="Object")
+
+class VIEW3D_PT_block_placer3(Panel):
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Block Placer'
+    bl_label = "Transform via Mouse-Geo-location"
+    
+    def draw(self, context):
+        layout = self.layout
+
+        # Spiral Accumulate Rotation
+        box = layout.box()
+        row = box.row()
+        row.prop(context.scene, "show_incremental", icon='TRIA_DOWN' if context.scene.show_incremental else 'TRIA_RIGHT', icon_only=True, emboss=False)
+        row.label(text="Spiral Accumulate Rotation Per Increment")
         
-        # Grid settings
+        if context.scene.show_incremental:
+            col = box.column(align=True)
+            row = col.row(align=True)
+            row.prop(context.scene, "rotation_increment_euler", text="XYZ")
+            row = col.row()
+            row.operator("block_placer.reset_vector", text="Reset").property_name = "rotation_increment_euler"
+            row.operator("object.reset_placement_count", text="Reset Count")
+
+        # Face Rotation
         box = layout.box()
-        box.label(text="Grid Settings")
-        box.prop(context.scene, "grid_spacing", text="Grid Spacing")
-        box.prop(context.scene, "grid_offset", text="Grid Offset")
-
-
-
-        # Preview and Speed Settings
+        row = box.row()
+        row.prop(context.scene, "show_face_rotation", icon='TRIA_DOWN' if context.scene.show_face_rotation else 'TRIA_RIGHT', icon_only=True, emboss=False)
+        row.label(text="Face Rotation")
+        
+        if context.scene.show_face_rotation:
+            col = box.column(align=True)
+            row = col.row(align=True)
+            row.prop(context.scene, "face_rotation", text="XYZ")
+            row = col.row()
+            row.operator("block_placer.reset_vector", text="Reset").property_name = "face_rotation"
+            
+        # Edge Rotation
         box = layout.box()
-        box.label(text="Placement Settings")
-        box.prop(context.scene, "show_placement_preview", text="Show Preview")
-        box.prop(context.scene, "placement_speed", text="Placement Speed")
+        row = box.row()
+        row.prop(context.scene, "show_edge_rotation", icon='TRIA_DOWN' if context.scene.show_edge_rotation else 'TRIA_RIGHT', icon_only=True, emboss=False)
+        row.label(text="Edge Rotation")
+        
+        if context.scene.show_edge_rotation:
+            col = box.column(align=True)
+            row = col.row(align=True)
+            row.prop(context.scene, "edge_rotation", text="XYZ")
+            row = col.row()
+            row.operator("block_placer.reset_vector", text="Reset").property_name = "edge_rotation"
+            
+        # Corner Rotation
+        box = layout.box()
+        row = box.row()
+        row.prop(context.scene, "show_corner_rotation", icon='TRIA_DOWN' if context.scene.show_corner_rotation else 'TRIA_RIGHT', icon_only=True, emboss=False)
+        row.label(text="Corner Rotation")
+        
+        if context.scene.show_corner_rotation:
+            col = box.column(align=True)
+            row = col.row(align=True)
+            row.prop(context.scene, "corner_rotation", text="XYZ")
+            row = col.row()
+            row.operator("block_placer.reset_vector", text="Reset").property_name = "corner_rotation"
 
+        # Surface normal conforming toggle at the bottom
+        box = layout.box()
+        box.prop(context.scene, "conform_to_normal", text="Conform to Surface Normal")
+
+
+
+
+
+
+class OBJECT_OT_reset_placement_count(Operator):
+    bl_idname = "object.reset_placement_count"
+    bl_label = "Reset Placement Count"
+    bl_description = "Reset the placement count for rotation increments"
+    
+    def execute(self, context):
+        context.scene.placement_count = 0
+        return {'FINISHED'}
+
+# Add to classes tuple
 classes = (
     OBJECT_OT_block_placer,
+    OBJECT_OT_reset_vector,
+    OBJECT_OT_reset_placement_count,
+    OBJECT_OT_save_preset,
+    OBJECT_OT_load_preset,  # Added
+    VIEW3D_MT_block_placer_presets,
+    BlockPlacerPreset,
     VIEW3D_PT_block_placer,
+    VIEW3D_PT_block_placer2,
+    VIEW3D_PT_block_placer3,
 )
 
 def register():
@@ -462,7 +878,7 @@ def register():
     
     # Register grid customization properties
     bpy.types.Scene.grid_spacing = FloatVectorProperty(
-        name="Grid Spacing",
+        name="Dotting Spacing",
         description="Spacing between grid lines on each axis",
         default=(1.0, 1.0, 1.0),
         min=0.001,
@@ -471,7 +887,7 @@ def register():
     )
     
     bpy.types.Scene.grid_offset = FloatVectorProperty(
-        name="Grid Offset",
+        name="Grid Map Offset",
         description="Offset of the grid from world origin",
         default=(0.0, 0.0, 0.0),
         size=3
@@ -526,6 +942,244 @@ def register():
         soft_max=50.0
     )
 
+
+
+
+
+    bpy.types.Scene.use_rotation_increment = bpy.props.BoolProperty(
+        name="Use Rotation Increment",
+        description="Incrementally rotate each placed object",
+        default=False
+    )
+    
+    bpy.types.Scene.placement_count = bpy.props.IntProperty(
+        name="Placement Count",
+        description="Counter for incremental rotations",
+        default=0,
+        min=0
+    )
+    
+    # Per-axis increment toggles
+    bpy.types.Scene.increment_x = bpy.props.BoolProperty(
+        name="Increment X",
+        description="Enable rotation increment on X axis",
+        default=True
+    )
+    
+    bpy.types.Scene.increment_y = bpy.props.BoolProperty(
+        name="Increment Y",
+        description="Enable rotation increment on Y axis",
+        default=True
+    )
+    
+    bpy.types.Scene.increment_z = bpy.props.BoolProperty(
+        name="Increment Z",
+        description="Enable rotation increment on Z axis",
+        default=True
+    )
+
+
+    # Register new properties for relative rotation
+    bpy.types.Scene.edge_rotation_angle = bpy.props.FloatProperty(
+        name="Edge Rotation Angle",
+        description="Rotation angle for edge placements (degrees)",
+        default=15.0,
+        min=-360.0,
+        max=360.0
+    )
+    
+    bpy.types.Scene.corner_rotation_angle = bpy.props.FloatProperty(
+        name="Corner Rotation Angle",
+        description="Rotation angle for corner placements (degrees)",
+        default=90.0,
+        min=-360.0,
+        max=360.0
+    )
+
+
+
+
+
+
+
+
+    bpy.types.Scene.show_scale = bpy.props.BoolProperty(
+        name="Show Scale",
+        description="Show scale properties",
+        default=False
+    )
+
+    bpy.types.Scene.show_rotation = bpy.props.BoolProperty(
+        name="Show Rotation",
+        description="Show rotation properties",
+        default=False
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+    bpy.types.Scene.show_grid = bpy.props.BoolProperty(
+        name="Show Grid",
+        description="Show Grid properties",
+        default=False
+    )
+
+
+
+    bpy.types.Scene.show_grid_spacing = bpy.props.BoolProperty(
+        name="Show Grid Spacing",
+        description="Show Grid Spacing properties",
+        default=False
+    )
+
+    bpy.types.Scene.show_grid_offset = bpy.props.BoolProperty(
+        name="Show Grid Offset",
+        description="Show Grid Offset properties",
+        default=False
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # Add to register():
+    
+
+    # Geo-transforms master toggle
+    bpy.types.Scene.use_geo_transforms = bpy.props.BoolProperty(
+        name="Enable Geo-based Transforms",
+        description="Enable transformations based on placement location",
+        default=False
+    )
+
+    # Incremental rotation using euler
+    bpy.types.Scene.rotation_increment_euler = FloatVectorProperty(
+        name="Increment Rotation",
+        description="Rotation increment per placement (degrees)",
+        default=(0.0, 0.0, 0.0),
+        subtype='EULER',
+        size=3
+    )
+
+    # Relative rotation angles
+    bpy.types.Scene.face_rotation_angle = bpy.props.FloatProperty(
+        name="Face Rotation Angle",
+        description="Rotation angle for face placements (degrees)",
+        default=0.0,
+        min=-360.0,
+        max=360.0
+    )
+
+    # Dropdown toggles
+    bpy.types.Scene.show_incremental = bpy.props.BoolProperty(
+        name="Show Incremental Settings",
+        description="Show incremental rotation settings",
+        default=False
+    )
+
+    bpy.types.Scene.show_relative = bpy.props.BoolProperty(
+        name="Show Relative Settings",
+        description="Show relative rotation settings",
+        default=False
+    )
+
+
+
+
+
+
+
+
+
+
+    # Register new properties
+    bpy.types.Scene.block_placer_presets = \
+        bpy.props.CollectionProperty(type=BlockPlacerPreset)
+    
+    bpy.types.Scene.block_placer_preset = bpy.props.StringProperty(
+        name="Active Preset",
+        default="Default"
+    )
+
+    bpy.types.Scene.conform_to_normal = bpy.props.BoolProperty(
+        name="Conform to Surface Normal",
+        description="Align rotation with surface normal",
+        default=True
+    )
+
+    bpy.types.Scene.face_rotation = FloatVectorProperty(
+        name="Face Rotation",
+        description="Rotation applied when placing on faces",
+        default=(0.0, 0.0, 0.0),
+        subtype='EULER',
+        size=3
+    )
+
+    bpy.types.Scene.edge_rotation = FloatVectorProperty(
+        name="Edge Rotation",
+        description="Rotation applied when placing on edges",
+        default=(0.0, 0.0, 0.0),
+        subtype='EULER',
+        size=3
+    )
+
+    bpy.types.Scene.corner_rotation = FloatVectorProperty(
+        name="Corner Rotation",
+        description="Rotation applied when placing on corners",
+        default=(0.0, 0.0, 0.0),
+        subtype='EULER',
+        size=3
+    )
+
+
+
+
+
+
+
+
+
+
+
+    # Add these to your existing register function:
+    bpy.types.Scene.show_face_rotation = bpy.props.BoolProperty(
+        name="Show Face Rotation",
+        description="Show face rotation settings",
+        default=False
+    )
+    
+    bpy.types.Scene.show_edge_rotation = bpy.props.BoolProperty(
+        name="Show Edge Rotation",
+        description="Show edge rotation settings",
+        default=False
+    )
+    
+    bpy.types.Scene.show_corner_rotation = bpy.props.BoolProperty(
+        name="Show Corner Rotation",
+        description="Show corner rotation settings",
+        default=False
+    )
+
+
+
+
 def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
@@ -542,6 +1196,42 @@ def unregister():
 
     del bpy.types.Scene.show_placement_preview
     del bpy.types.Scene.placement_speed
+
+    # Unregister rotation increment properties
+    del bpy.types.Scene.placement_count
+
+
+
+    del bpy.types.Scene.edge_rotation_angle
+    del bpy.types.Scene.corner_rotation_angle
+
+
+    del bpy.types.Scene.show_scale
+    del bpy.types.Scene.show_rotation
+
+
+    del bpy.types.Scene.show_grid_spacing
+    del bpy.types.Scene.show_grid_offset
+    del bpy.types.Scene.use_geo_transforms
+    del bpy.types.Scene.rotation_increment_euler
+    del bpy.types.Scene.face_rotation_angle
+    del bpy.types.Scene.show_incremental
+    del bpy.types.Scene.show_relative
+
+    del bpy.types.Scene.block_placer_presets
+    del bpy.types.Scene.block_placer_preset
+    del bpy.types.Scene.conform_to_normal
+    del bpy.types.Scene.face_rotation
+    del bpy.types.Scene.edge_rotation
+    del bpy.types.Scene.corner_rotation
+
+
+    # Add these to your existing unregister function:
+    del bpy.types.Scene.show_face_rotation
+    del bpy.types.Scene.show_edge_rotation
+    del bpy.types.Scene.show_corner_rotation
+
+
 
 if __name__ == "__main__":
     register()
